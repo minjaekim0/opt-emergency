@@ -1,0 +1,16 @@
+https://www.e-gen.or.kr/egen/notice_view.do?brdctsno=12861&upperfixyn=N&currentPageNum=1&brdclscd=02&searchTarget=ALL&searchKeyword=&searchDatayear=
+- 1. 응급의료기관 현황('24.09.30.)_e-gen.xlsx
+- 2. 응급의료기관 외의 의료기관(응급의료시설)('24.09.30.)_e-gen.xlsx
+
+https://jumin.mois.go.kr/ageStatMonth.do
+- 202409_202409_연령별인구현황_월간.csv (읍면동 단위)
+
+https://jumin.mois.go.kr/statMonth.do
+- 202409_202409_주민등록인구및세대현황_월간.xlsx (시군구 단위)
+
+https://www.data.go.kr/data/15059715/fileData.do
+- 행정안전부_읍면동 하부행정기관 현황_20240731.csv
+
+https://neurowhai.tistory.com/350
+- TL_SCCO_CTPRVN.json
+- TL_SCCO_SIG.json
