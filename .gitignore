@@ -11,4 +11,5 @@ venv/
 env/
 
 private.py
-output/
+*output/
+tmp*

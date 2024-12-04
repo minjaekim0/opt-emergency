@@ -14,16 +14,21 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 class Logger:
     def __init__(self, output_dir: str) -> None:
         self.output_dir = output_dir
+        self.logs = list()
 
     def log_append(self, log, show=True):
-        log_path = f"{self.output_dir}/event_log.txt"
-        with open(log_path, "a+") as f:
-            f.writelines(log + "\n")
+        self.logs.append(log)
         if show:
             print(log)
+    
+    def save(self):
+        log_path = f"{self.output_dir}/event_log.txt"
+        with open(log_path, "a+") as f:
+            for log in self.logs:
+                f.writelines(log + "\n")
 
 
-def find_project_root(path=".", marker="opt_emergency"):
+def find_project_root(path=".", marker="src"):
     current_path = os.path.abspath(path)
     while current_path != os.path.dirname(current_path):
         if marker in os.listdir(current_path):

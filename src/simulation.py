@@ -15,8 +15,9 @@ import pickle
 import sys
 import os
 sys.path.append(os.path.abspath(".."))
-from opt_emergency.utils import Logger, StrConverter, VizToolkit, find_project_root, PlotContext
-from opt_emergency.stat import ExponentialDistApprox
+from src.utils import Logger, StrConverter, VizToolkit, find_project_root, PlotContext
+from src.stat import ExponentialDistApprox
+from src.preprocessing import RegionFilter, bed_num_imputation, WeightedAverageDistribution
 
 sns.set_style("darkgrid")
 plt.rcParams["font.family"] = "Nanum Gothic"
@@ -37,10 +38,20 @@ class SimulationExecuter:
         nearest_er_from_region_df, 
         travel_time_between_er_df,
         random_seed=42,
+        additional_indicators=True,
         visualize=True, 
+        show_arrow=False,
         show_log=True, 
-        show_arrow=False
-    ):
+        show_bar=True,
+        save_data=True,
+    ):  
+        self.SIMULATION_START_TIME = datetime.now().strftime("%y%m%d_%H%M%S")
+        if save_data:
+            PROJECT_ROOT_PATH = find_project_root()
+            self.output_dir = f"{PROJECT_ROOT_PATH}/output/{self.SIMULATION_START_TIME}/"
+            os.mkdir(self.output_dir)
+            self.logger = Logger(output_dir=self.output_dir)
+
         random.seed(random_seed)
         np.random.seed(random_seed)
 
@@ -50,10 +61,17 @@ class SimulationExecuter:
         self.ktas_level_distribution = ktas_level_distribution
         self.occupancy_duration_distribution = occupancy_duration_distribution
         self.pop_df = pop_df
-        self.er_df = er_df
+        self.er_df = er_df.copy()
+        self.nearest_er_from_region_df = nearest_er_from_region_df
+        self.additional_indicators = additional_indicators
         self.visualize = visualize
-        self.show_log = show_log
         self.show_arrow = show_arrow
+        self.show_log = show_log
+        self.show_bar = show_bar
+        self.save_data = save_data
+
+        self.er_df = self.er_df[self.er_df["hperyn"] > 0]
+        self._check_if_alienated_region_exists()
 
         nearest_er_from_region_df["region"] = nearest_er_from_region_df.apply(
             lambda x: f"{x['시도']}_{x['시군구']}_{x['읍면동']}".replace(" ", "_"), axis=1
@@ -73,41 +91,50 @@ class SimulationExecuter:
             self.travel_time_between_er_mapping[f"{hpid1}_{hpid2}"] = travel_time
 
         self.env = simpy.Environment()
-        self.er_resources = {
-            getattr(row, "hpid"): simpy.PriorityResource(env=self.env, capacity=getattr(row, "hperyn"))
-            for row in er_df.itertuples()
-        }
-        self.er_trackers = {
-            getattr(row, "hpid"): ERTracker(
-                hpid=getattr(row, "hpid"), capacity=getattr(row, "hperyn"), env=self.env
-            )
-            for row in er_df.itertuples()
-        }
+
+        self.er_resources = dict()
+        self.er_trackers = dict()
+        for row in self.er_df.itertuples():
+            hpid = getattr(row, "hpid")
+            num_beds = getattr(row, "hperyn")
+            self.er_resources[hpid] = simpy.PriorityResource(env=self.env, capacity=num_beds)
+            self.er_trackers[hpid] = ERTracker(hpid, num_beds, self.env)
+                
         self.patient_trackers = {i: PatientTracker(i) for i in range(self.patient_cnt)}
 
         self.avg_occupancy_duration = None
         self.sampling = dict()
         self._sampling()
 
-        self.indc = IndicatorCalculator(
-            self.env, target_sido, 
-            self.er_resources, self.er_trackers, self.patient_trackers, 
-            pop_df, er_df
-        )
-        if visualize:
-            self.viz = SimulationVisualizer(
-                self.env, self.indc, target_sido, 
+        assert not (additional_indicators is False and visualize is True)
+        if additional_indicators:
+            self.indc = IndicatorCalculator(
+                self.env, target_sido, 
                 self.er_resources, self.er_trackers, self.patient_trackers, 
-                pop_df, er_df, self.avg_occupancy_duration, show_arrow
+                pop_df, self.er_df
             )
-            
-        self.SIMULATION_START_TIME = datetime.now().strftime("%y%m%d_%H%M%S")
-        PROJECT_ROOT_PATH = find_project_root()
-        self.output_dir = f"{PROJECT_ROOT_PATH}/output/{self.SIMULATION_START_TIME}/"
-        os.mkdir(self.output_dir)
-        self.logger = Logger(
-            output_dir=self.output_dir
-        )
+            if visualize:
+                assert not (visualize is False and show_arrow is True)
+                self.viz = SimulationVisualizer(
+                    self.env, self.indc, target_sido, 
+                    self.er_resources, self.er_trackers, self.patient_trackers, 
+                    pop_df, self.er_df, self.avg_occupancy_duration, show_arrow
+                )
+    
+    def _check_if_alienated_region_exists(self):
+        """
+        특정 지역의 1st, 2nd, 3rd, center 응급의료기관 4가지 모두 병상 수가 0일 경우
+        해당 지역은 응급실 접근성이 매우 떨어지게 되는 상황임.
+        따라서 적절치 않은 input으로 보고 error 발생시킴.
+        """
+        for row in self.nearest_er_from_region_df.itertuples():
+            postfixes = ["1st", "2nd", "3rd", "center"]
+            bools = list()
+            for pf in postfixes:
+                bools.append(getattr(row, "nearest_er_hpid_" + pf) not in self.er_df["hpid"].tolist())
+            if all(bools):
+                region = getattr(row, "시도") + "_" + getattr(row, "시군구") + "_" + getattr(row, "읍면동")
+                raise Exception(f"{region}에서 1st, 2nd, 3rd, center 응급의료기관 모두 병상 수 = 0")
     
     def _sampling(self):
         # 환자 발생 시간 sampling; 단위: day
@@ -166,15 +193,21 @@ class SimulationExecuter:
     def run(self):
         """시뮬레이션 실행"""
         self.env.process(self.patient_occur())
-        self.env.process(self.indc.keep_updating())
+        if self.additional_indicators:
+            self.env.process(self.indc.keep_updating())
         if self.visualize:
             self.env.process(self.viz.keep_plotting())
         
         end_time_smoother = 1 / (24 * 60)
         self.env.run(until=self.duration + end_time_smoother)
         
-        self._save_data()
-
+        print()
+        if self.additional_indicators and self.save_data:
+            self._save_data()
+            self.logger.save()
+        if self.visualize:
+            self.viz.main.mainloop()
+        
     def _save_data(self):
         avg_occupancy_rate_each_hpid_df = pd.DataFrame(index=self.er_df.hpid, columns=["avg_occupancy_rate"])
         for h, vals in self.indc.each_occupancy_rate_record.items():
@@ -203,15 +236,17 @@ class SimulationExecuter:
             region = self.sampling[patient_id]["occurrence_region"]
             self.patient_trackers[patient_id].occur(self.env.now, region)
 
-            log = f"{StrConverter.time2str(self.env.now)}: " + \
-                f"환자 {patient_id} 발생; {region}"
-            self.logger.log_append(log, show=self.show_log)            
+            if self.save_data:
+                log = f"{StrConverter.time2str(self.env.now)}: " + \
+                    f"환자 {patient_id} 발생; {region}"
+                self.logger.log_append(log, show=self.show_log)            
 
             goal_hpid, goal_travel_time = self._select_er(region)
             self.env.process(self.transport_patient(region, goal_hpid, patient_id, goal_travel_time, by_ktas=False))
             patient_id += 1
 
-            if self.show_log is False:
+            assert not (self.show_log is True and self.show_bar is True)
+            if self.show_log is False and self.show_bar is True:
                 time_elapsed = datetime.now() - datetime.strptime(self.SIMULATION_START_TIME, '%y%m%d_%H%M%S')
                 print(f"\r[{time_elapsed}] {patient_id + 1} / {self.patient_cnt} ", end="")
             
@@ -221,10 +256,12 @@ class SimulationExecuter:
         권역/지역응급센터 -> 선택 가중치 3배
         """
         postfixes = ["1st", "2nd", "3rd", "center"]
-        info_dict = {pf: dict() for pf in postfixes}
+        info_dict = dict()
         
         for pf in postfixes:
             hpid = self.nearest_er_from_region_mapping[str(region)][f"nearest_er_hpid_{pf}"]
+            if hpid not in self.er_df["hpid"].tolist():
+                continue
             er_type = self.er_type_mapping[hpid]
             travel_time = self.nearest_er_from_region_mapping[str(region)][f"nearest_er_travel_time_{pf}"]
             info_dict[pf] = {"hpid": hpid, "er_type": er_type, "travel_time": travel_time}
@@ -238,7 +275,7 @@ class SimulationExecuter:
                 weight *= center_weight
             er_select_weights.append(weight)
 
-        selected_pf = random.choices(population=postfixes, weights=er_select_weights, k=1)[0]
+        selected_pf = random.choices(population=list(info_dict.keys()), weights=er_select_weights, k=1)[0]
         goal_hpid_ = info_dict[selected_pf]["hpid"]
 
         transport_etc_time = 15 / (60 * 24)
@@ -252,9 +289,10 @@ class SimulationExecuter:
         yield self.env.timeout(travel_time)
         self.env.process(self._check_availability(hpid_to, patient_id, by_ktas))
 
-        log = f"{StrConverter.time2str(self.env.now)}: " + \
-            f"환자 {patient_id} 이송; {region} -> {hpid_to}"
-        self.logger.log_append(log, show=self.show_log)
+        if self.save_data:
+            log = f"{StrConverter.time2str(self.env.now)}: " + \
+                f"환자 {patient_id} 이송; {region} -> {hpid_to}"
+            self.logger.log_append(log, show=self.show_log)
 
         if self.visualize and self.show_arrow:
             self.viz.arrow_graphics.new_arrow_from_region(region, hpid_to, self.env.now)
@@ -265,9 +303,11 @@ class SimulationExecuter:
         yield self.env.timeout(travel_time)
         self.env.process(self._check_availability(hpid_to, patient_id, by_ktas))
 
-        log = f"{StrConverter.time2str(self.env.now)}: " + \
-            f"환자 {patient_id} 전원; {hpid_from} -> {hpid_to}"
-        self.logger.log_append(log, show=self.show_log)
+        if self.save_data:
+            log = f"{StrConverter.time2str(self.env.now)}: " + \
+                f"환자 {patient_id} 전원; {hpid_from} -> {hpid_to}"
+            self.logger.log_append(log, show=self.show_log)
+        
         self.patient_trackers[patient_id].transfer(by_ktas)
         
         if self.visualize and self.show_arrow:
@@ -321,8 +361,10 @@ class SimulationExecuter:
         if self.visualize:
             self.viz.er_graphics.update_cnt(hpid)
 
-        log = f"{StrConverter.time2str(self.env.now)}: 환자 {patient_id} 수용; {hpid}"
-        self.logger.log_append(log, show=self.show_log)
+        if self.save_data:
+            log = f"{StrConverter.time2str(self.env.now)}: 환자 {patient_id} 수용; {hpid}"
+            self.logger.log_append(log, show=self.show_log)
+
         self.env.process(self.treat_patient(hpid, patient_id))
 
     def treat_patient(self, hpid, patient_id):
@@ -334,8 +376,10 @@ class SimulationExecuter:
         occupancy_duration = self.sampling[patient_id]["occupancy_duration"]
         self.er_trackers[hpid].start_treatment(patient_id, occupancy_duration)
         self.patient_trackers[patient_id].start_treatment(self.env.now, occupancy_duration)
-        log = f"{StrConverter.time2str(self.env.now)}: 환자 {patient_id} 치료; {hpid}"
-        self.logger.log_append(log, show=self.show_log)
+
+        if self.save_data:
+            log = f"{StrConverter.time2str(self.env.now)}: 환자 {patient_id} 치료; {hpid}"
+            self.logger.log_append(log, show=self.show_log)
 
         yield self.env.timeout(occupancy_duration)
         
@@ -346,8 +390,9 @@ class SimulationExecuter:
         if self.visualize:
             self.viz.er_graphics.update_cnt(hpid)
 
-        log = f"{StrConverter.time2str(self.env.now)}: 환자 {patient_id} 퇴원; {hpid}"
-        self.logger.log_append(log, show=self.show_log)
+        if self.save_data:
+            log = f"{StrConverter.time2str(self.env.now)}: 환자 {patient_id} 퇴원; {hpid}"
+            self.logger.log_append(log, show=self.show_log)
 
     @staticmethod
     def _ktas2priority(ktas_level):
@@ -557,6 +602,8 @@ class IndicatorCalculator:
             for sido in target_sido
         }
 
+        self.hpid_mapping = self.er_df[["hpid", "시도", "의료기관분류"]].set_index("hpid").to_dict("index")
+
     def keep_updating(self):
         while True:
             yield self.env.timeout(1 / 24)  # 1시간 단위 plot
@@ -581,8 +628,7 @@ class IndicatorCalculator:
                 self.occupancy_rate_data[sido][er_type] = list()
 
                 for hpid, vals in self.each_occupancy_rate_record.items():
-                    sido_hpid = self.er_df.loc[self.er_df["hpid"] == hpid, "시도"].iloc[0]
-                    er_type_hpid = self.er_df.loc[self.er_df["hpid"] == hpid, "의료기관분류"].iloc[0]
+                    sido_hpid, er_type_hpid = self.hpid_mapping[hpid].values()
 
                     if sido_hpid == sido:
                         if er_type == "센터":
@@ -620,8 +666,7 @@ class IndicatorCalculator:
                 self.queue_len_data[sido][er_type] = list()
 
                 for hpid, resoruce in self.er_resources.items():
-                    sido_hpid = self.er_df.loc[self.er_df["hpid"] == hpid, "시도"].iloc[0]
-                    er_type_hpid = self.er_df.loc[self.er_df["hpid"] == hpid, "의료기관분류"].iloc[0]
+                    sido_hpid, er_type_hpid = self.hpid_mapping[hpid].values()
 
                     if sido_hpid == sido:
                         if er_type == "센터":
@@ -977,63 +1022,57 @@ class ArrowGraphics:
 
 
 def main():
-    target_sido = ["대구", "경북"]
-
     emergency_df = pd.read_csv("../data/processed/emergency_df.csv")
     population_df = pd.read_csv("../data/processed/community_population_df.csv")
-    emergency_tk = emergency_df[
-        (emergency_df["시도"].isin(target_sido)) &
-        (emergency_df["시군구"] != "울릉군")
-    ]
-    population_tk = population_df[
-        (population_df["시도"].isin(target_sido)) &
-        (population_df["시군구"] != "울릉군")
-    ]
-    nearest_er_tk = pd.read_csv("../data/processed/nearest_er_tk_daytime.csv")
+    nearest_er_df = pd.read_csv("../data/processed/nearest_er_tk_daytime.csv")
     travel_time_between_er_df = pd.read_csv("../data/processed/travel_time_between_er_tk_daytime.csv")
-    travel_time_between_er_df = travel_time_between_er_df[
-        (travel_time_between_er_df.hpid1 != "E2700553") & (travel_time_between_er_df.hpid2 != "E2700553")
-    ]  # 울릉군보건의료원 제외
-
-    def preprocessing():
-        # 응급실 병상 수 전처리
-        avg_hperyn = emergency_tk.groupby("의료기관분류").hperyn.mean().round()
-        for typ, avg in avg_hperyn.items():
-            emergency_tk.loc[emergency_tk["의료기관분류"] == typ, "hperyn"] = \
-                emergency_tk.loc[emergency_tk["의료기관분류"] == typ, "hperyn"].fillna(avg).replace(0, avg)
-    preprocessing()
-
-    population_data = {
-        sido: population_tk[population_tk["시도"] == sido]["인구수"].sum() for sido in target_sido
-    }
     ktas_level_ratio_df = pd.read_csv("../data/processed/ktas_level_ratio.csv").astype({"ktas": str})
     occupancy_duration_df = pd.read_csv("../data/processed/occupancy_duration_ktas_corr.csv")
+    target_sido = ["대구", "경북"]
+    sigungu_excluded = ["울릉군"]
+    
+    rf = RegionFilter(emergency_df, population_df, travel_time_between_er_df, target_sido, sigungu_excluded)
+    emergency_df = rf.emergency_df_filtering()
+    population_df = rf.population_df_filtering()
+    travel_time_between_er_df = rf.travel_time_between_er_df_filtering()
+    bed_num_imputation(emergency_df)
+    wa = WeightedAverageDistribution(ktas_level_ratio_df, occupancy_duration_df, population_df, target_sido)
+    ktas_level_distribution = wa.ktas_level_ratio()
+    occupancy_duration_distribution = wa.occupancy_duration()
 
-    # 경북에서 발생한 ktas=12 환자가 대구로 바로 이송됐을 가능성 존재
-    # -> ktas_level, occupancy_duration은 인구수로 가중평균해서 사용
-    ktas_level_distribution = list()
-    for ktas_level in ["ktas12", "ktas3", "ktas45"]:
-        weighted_avg = 0
-        for sido, pop in population_data.items():
-            weighted_avg += ktas_level_ratio_df[
-                (ktas_level_ratio_df["시도"] == sido) & (ktas_level_ratio_df["ktas"] == ktas_level)
-            ]["ratio"].iloc[0] * pop
-        weighted_avg /= sum(population_data.values())
-        ktas_level_distribution.append(weighted_avg)
+    params = {'A2700014': -3,
+        'A1300018': -10,
+        'A2700018': -6,
+        'A2700001': -8,
+        'A2700005': -10,
+        'A1303386': -10,
+        'A2700015': -7,
+        'A1300005': -10,
+        'A1300076': -7,
+        'A1300007': -10,
+        'A1300110': -10,
+        'A1300034': -10,
+        'A1300045': -9,
+        'A2700011': -10,
+        'A2702752': -4,
+        'A2700009': -2,
+        'A2702563': -9,
+        'A1300011': -6,
+        'A2700052': -5,
+        'A2700038': -6,
+        'A2700023': -4,
+        'A2700070': -5,
+        'A2700063': -4,
+        'E2700554': -4,
+        'A2700097': -10,
+        'A2700071': -5,
+        'A2700030': -2,
+        'A2700020': -8,
+        'A2700026': -2,
+        'A2700066': -4}
+    for k, v in params.items():
+        emergency_df.loc[emergency_df.hpid == k, "hperyn"] += v
 
-    occupancy_duration_distribution = dict()
-    for ktas in occupancy_duration_df["ktas"].drop_duplicates():
-        occupancy_duration_weighted_sum = np.zeros(7)
-
-        for sido in target_sido:
-            occ_dur = occupancy_duration_df[
-                (occupancy_duration_df["시도"] == sido) & (occupancy_duration_df["ktas"] == ktas)
-            ].to_numpy()[0][2:].astype(float)
-            occupancy_duration_weighted_sum += occ_dur * population_data[sido]
-
-        occupancy_duration_distribution[ktas] = \
-            occupancy_duration_weighted_sum / occupancy_duration_weighted_sum.sum() * 100
-            
     DURATION = 30
     PATIENT_CNT_ONE_MONTH = 38000
     PATIENT_CNT = int(PATIENT_CNT_ONE_MONTH / 30 * DURATION)  # 38000 / 1month
@@ -1044,13 +1083,14 @@ def main():
         target_sido=target_sido,
         ktas_level_distribution=ktas_level_distribution,
         occupancy_duration_distribution=occupancy_duration_distribution,
-        pop_df=population_tk,
-        er_df=emergency_tk,
-        nearest_er_from_region_df=nearest_er_tk,
+        pop_df=population_df,
+        er_df=emergency_df,
+        nearest_er_from_region_df=nearest_er_df,
         travel_time_between_er_df=travel_time_between_er_df,
+        additional_indicators=True,
         visualize=True,
         show_log=False,
-        show_arrow=True
+        show_arrow=False
     )
     executer.run()
 
